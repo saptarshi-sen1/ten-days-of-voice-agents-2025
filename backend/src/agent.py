@@ -1,8 +1,8 @@
 import logging
 import json
 import os
-from datetime import datetime
 from pathlib import Path
+from datetime import datetime
 
 from dotenv import load_dotenv
 from livekit.agents import (
@@ -10,207 +10,173 @@ from livekit.agents import (
     AgentSession,
     JobContext,
     JobProcess,
-    MetricsCollectedEvent,
     RoomInputOptions,
     WorkerOptions,
     cli,
-    metrics,
     tokenize,
+    metrics,
     function_tool,
     RunContext
 )
 from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-logger = logging.getLogger("agent")
+# ----------------------------------------------------
+# ENV + GLOBALS
+# ----------------------------------------------------
+
 load_dotenv(".env.local")
+logger = logging.getLogger("agent")
 
-# ============================================================
-#   Persistence Folder + Save Function
-# ============================================================
+BASE_DIR = Path(__file__).resolve().parent.parent  # backend/
+CONTENT_DIR = BASE_DIR / "shared-data"
+CONTENT_DIR.mkdir(exist_ok=True)
 
-LOG_DIR = Path("health_and_wellness")
-LOG_DIR.mkdir(exist_ok=True)
+# ----------------------------------------------------
+# AUTO-CREATE CONTENT FILE IF MISSING
+# ----------------------------------------------------
 
-def save_checkin_to_file(checkin_data: dict) -> str:
-    """
-    Saves a wellness check-in to a timestamped JSON file:
-       health_and_wellness/checkin_2025-11-23_18-10-04.json
-    """
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    filename = f"checkin_{timestamp}.json"
-    filepath = LOG_DIR / filename
+timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-    with open(filepath, "w") as f:
-        json.dump(checkin_data, f, indent=2)
+DEFAULT_CONTENT = [
+    {
+        "id": "variables",
+        "title": "Variables",
+        "summary": "Variables store values that you can reuse later in your program.",
+        "sample_question": "What is a variable and why is it useful?"
+    },
+    {
+        "id": "loops",
+        "title": "Loops",
+        "summary": "Loops allow repeating actions multiple times without rewriting code.",
+        "sample_question": "Explain the difference between a for loop and a while loop."
+    }
+]
 
-    return str(filepath)
+# Look for an existing file
+existing_files = list(CONTENT_DIR.glob("day4_tutor_content*.json"))
 
+if existing_files:
+    CONTENT_PATH = existing_files[0]
+else:
+    CONTENT_PATH = CONTENT_DIR / f"day4_tutor_content_{timestamp}.json"
+    with open(CONTENT_PATH, "w", encoding="utf-8") as f:
+        json.dump(DEFAULT_CONTENT, f, indent=2)
 
-# ============================================================
-#   Wellness Agent State
-# ============================================================
+# Load content
+with open(CONTENT_PATH, "r", encoding="utf-8") as f:
+    COURSE_CONTENT = json.load(f)
 
-class WellnessState:
-    def __init__(self):
-        self.state = {
-            "mood": None,
-            "energy": None,
-            "stress": None,
-            "goals": [],
-            "summary": None
-        }
+# ----------------------------------------------------
+# TUTOR AGENT
+# ----------------------------------------------------
 
-    def is_complete(self):
-        return (
-            self.state["mood"] is not None and
-            self.state["energy"] is not None and
-            self.state["goals"]
-        )
-
-    def next_question(self):
-        if self.state["mood"] is None:
-            return "How are you feeling today? What's your mood like?"
-        if self.state["energy"] is None:
-            return "How would you describe your energy right now? High, medium, or low?"
-        if self.state["stress"] is None:
-            return "Is anything stressing you out today, or are you feeling okay?"
-        if not self.state["goals"]:
-            return "What are 1–3 simple goals you'd like to focus on today?"
-        return None
-
-
-# ============================================================
-#   MAIN WELLNESS AGENT
-# ============================================================
-
-class WellnessAgent(Agent):
-
+class TutorAgent(Agent):
     def __init__(self):
         super().__init__(
             instructions="""
-You are a calm, supportive, but realistic daily health & wellness companion.
+You are an AI active recall tutor with 3 modes:
+1. learn – explain a concept using its summary.
+2. quiz – ask the user questions using sample_question.
+3. teach_back – ask the user to explain the concept back and give basic feedback.
 
-Your job each day:
-1. Ask about mood → energy → stress → goals (1–3).
-2. After each response, call update_checkin(field, value).
-3. When all fields are filled, call save_checkin().
-4. After saving, give a short recap and encouragement.
+Rules:
+• NEVER output JSON.
+• Detect mode changes from user messages.
+• ALWAYS speak with the correct Murf voice depending on mode.
+• Keep responses concise and conversational.
+""")
 
-Important rules:
-- Avoid all medical or diagnostic statements.
-- Keep suggestions simple, actionable, grounded.
-- Never print JSON — always use the tools for updating or saving.
-"""
-        )
+        self.mode = None  # "learn", "quiz", "teach_back"
+        self.current_concept = None  # object from COURSE_CONTENT
 
-        self.state = WellnessState()
+    # ------------------------------------------------
+    # HELPER: choose concept
+    # ------------------------------------------------
+    def find_concept(self, text: str):
+        text = text.lower()
+        for c in COURSE_CONTENT:
+            if c["id"] in text or c["title"].lower() in text:
+                return c
+        return None
 
-
-    # ---------------------------------------------------------
-    #   TOOL: Update fields during conversation
-    # ---------------------------------------------------------
-
+    # ------------------------------------------------
+    # TOOL: Switch learning mode
+    # ------------------------------------------------
     @function_tool
-    async def update_checkin(self, ctx: RunContext, field: str, value: str) -> str:
-        """
-        Update one check-in field.
-        Fields: mood, energy, stress, goals
-        For 'goals', value is appended.
-        """
-        if field == "goals":
-            self.state.state["goals"].append(value)
-        else:
-            self.state.state[field] = value
-        return "updated"
+    async def switch_mode(self, ctx: RunContext, mode: str) -> str:
+        self.mode = mode
+        return f"Mode changed to {mode}"
 
-
-    # ---------------------------------------------------------
-    #   TOOL: Save final check-in to timestamped JSON file
-    # ---------------------------------------------------------
-
+    # ------------------------------------------------
+    # TOOL: Select concept
+    # ------------------------------------------------
     @function_tool
-    async def save_checkin(self, ctx: RunContext) -> str:
-        """
-        Save the wellness check-in to a timestamped JSON file.
-        """
-        mood = self.state.state["mood"] or "unknown"
-        goals_list = self.state.state["goals"]
-        goals_text = ", ".join(goals_list) if goals_list else "no goals"
+    async def pick_concept(self, ctx: RunContext, concept_id: str) -> str:
+        for c in COURSE_CONTENT:
+            if c["id"] == concept_id:
+                self.current_concept = c
+                return "concept_selected"
+        return "not_found"
 
-        # Generate an auto-summary
-        self.state.state["summary"] = (
-            f"Mood: {mood}, Goals: {goals_text}"
-        )
-
-        filepath = save_checkin_to_file(self.state.state)
-        return filepath
-
-
-    # ---------------------------------------------------------
-    #   USER MESSAGE HANDLER
-    # ---------------------------------------------------------
-
+    # ------------------------------------------------
+    # RESPOND TO USER
+    # ------------------------------------------------
     async def on_user_message(self, msg, ctx):
         text = msg.text.lower()
 
-        # Simple keyword detection
-        mood_words = ["happy", "sad", "okay", "fine", "good", "bad", "stressed"]
-        energy_words = ["low", "medium", "high", "tired", "energetic"]
-        stress_words = ["yes", "a bit", "no", "not really", "kind of"]
+        # Detect mode switches
+        if "learn" in text:
+            await ctx.tool_call(self.switch_mode, mode="learn")
+        elif "quiz" in text:
+            await ctx.tool_call(self.switch_mode, mode="quiz")
+        elif "teach" in text or "teach back" in text:
+            await ctx.tool_call(self.switch_mode, mode="teach_back")
 
-        # Mood
-        for w in mood_words:
-            if w in text and self.state.state["mood"] is None:
-                await ctx.tool_call(self.update_checkin, field="mood", value=w)
-                break
+        # Detect concept selection
+        concept = self.find_concept(text)
+        if concept:
+            await ctx.tool_call(self.pick_concept, concept_id=concept["id"])
 
-        # Energy
-        for w in energy_words:
-            if w in text and self.state.state["energy"] is None:
-                if w == "tired":
-                    w = "low"
-                await ctx.tool_call(self.update_checkin, field="energy", value=w)
-                break
-
-        # Stress
-        if self.state.state["stress"] is None:
-            if any(x in text for x in ["yes", "yeah", "yep", "stressed"]):
-                await ctx.tool_call(self.update_checkin, field="stress", value="stressed")
-            elif any(x in text for x in ["no", "not really", "fine", "okay"]):
-                await ctx.tool_call(self.update_checkin, field="stress", value="not stressed")
-
-        # Goals
-        if "goal" in text or "today i want" in text or "i want to" in text:
-            cleaned = text.replace("today i want to", "").replace("i want to", "").strip()
-            await ctx.tool_call(self.update_checkin, field="goals", value=cleaned)
-
-        # Ask next question if incomplete
-        if not self.state.is_complete():
-            await ctx.llm_response(self.state.next_question())
+        # If mode or concept missing → ask user
+        if not self.mode:
+            await ctx.llm_response("Welcome! Would you like to Learn, Quiz, or Teach Back?")
             return
 
-        # SAVE
-        filepath = await ctx.tool_call(self.save_checkin)
+        if not self.current_concept:
+            await ctx.llm_response("Great! Which topic? You can choose variables or loops.")
+            return
 
-        # FINAL SUMMARY
-        s = self.state.state
-        recap = (
-            f"Got it. You're feeling {s['mood']} with {s['energy']} energy. "
-            f"Today's goals are: {', '.join(s['goals'])}. "
-            "Thanks for checking in — I hope your day goes smoothly."
-        )
+        # -------------------- MODE: LEARN --------------------
+        if self.mode == "learn":
+            ctx.session.tts.voice = "en-US-matthew"  # Matthew
+            summary = self.current_concept["summary"]
+            await ctx.llm_response(f"Here's a quick explanation: {summary}")
+            return
 
-        await ctx.llm_response(recap)
+        # -------------------- MODE: QUIZ --------------------
+        elif self.mode == "quiz":
+            ctx.session.tts.voice = "en-US-alicia"  # Alicia
+            question = self.current_concept["sample_question"]
+            await ctx.llm_response(f"Alright! Here's your question: {question}")
+            return
+
+        # -------------------- MODE: TEACH BACK --------------------
+        elif self.mode == "teach_back":
+            ctx.session.tts.voice = "en-US-ken"  # Ken
+            question = self.current_concept["sample_question"]
+            await ctx.llm_response(
+                f"Great! Teach this back to me: {question}. I'll tell you how clearly you explained it."
+            )
+            return
 
 
-# ============================================================
-#   PREWARM + ENTRYPOINT
-# ============================================================
+# ----------------------------------------------------
+# SESSION CONFIG + ENTRYPOINT
+# ----------------------------------------------------
 
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
-
 
 async def entrypoint(ctx: JobContext):
     ctx.log_context = {"room": ctx.room.name}
@@ -221,41 +187,26 @@ async def entrypoint(ctx: JobContext):
         tts=murf.TTS(
             voice="en-US-matthew",
             style="Conversation",
-            tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
-            text_pacing=True
+            tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2)
         ),
-        turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
-        preemptive_generation=True,
+        turn_detection=MultilingualModel(),
+        preemptive_generation=True
     )
 
-    usage_collector = metrics.UsageCollector()
-
-    @session.on("metrics_collected")
-    def _on_metrics(ev: MetricsCollectedEvent):
-        usage_collector.collect(ev.metrics)
-        metrics.log_metrics(ev.metrics)
-
-    async def log_usage():
-        logger.info(f"Usage summary: {usage_collector.get_summary()}")
-
-    ctx.add_shutdown_callback(log_usage)
-
     await session.start(
-        agent=WellnessAgent(),
+        agent=TutorAgent(),
         room=ctx.room,
         room_input_options=RoomInputOptions(
-            noise_cancellation=noise_cancellation.BVC(),
-        ),
+            noise_cancellation=noise_cancellation.BVC()
+        )
     )
 
     await ctx.connect()
 
 
+
 if __name__ == "__main__":
     cli.run_app(
-        WorkerOptions(
-            entrypoint_fnc=entrypoint,
-            prewarm_fnc=prewarm
-        )
+        WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm)
     )

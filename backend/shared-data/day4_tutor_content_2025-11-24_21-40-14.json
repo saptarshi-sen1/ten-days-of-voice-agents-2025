@@ -1,0 +1,14 @@
+[
+  {
+    "id": "variables",
+    "title": "Variables",
+    "summary": "Variables store values that you can reuse later in your program.",
+    "sample_question": "What is a variable and why is it useful?"
+  },
+  {
+    "id": "loops",
+    "title": "Loops",
+    "summary": "Loops allow repeating actions multiple times without rewriting code.",
+    "sample_question": "Explain the difference between a for loop and a while loop."
+  }
+]
