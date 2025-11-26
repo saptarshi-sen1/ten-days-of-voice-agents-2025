@@ -1,0 +1,11 @@
+{
+  "verification_question": "What is the last 4 digits of your registered mobile number?",
+  "verification_answer": "1234",
+  "transaction": {
+    "amount": 5600,
+    "merchant": "Amazon",
+    "date": "2025-01-12"
+  },
+  "status": "pending",
+  "note": ""
+}

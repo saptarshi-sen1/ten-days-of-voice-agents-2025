@@ -1,0 +1,16 @@
+{
+  "case_id": "CASE_0001",
+  "userName": "John Doe",
+  "securityIdentifier": "SID-1001",
+  "cardEnding": "**** 4242",
+  "amount": "₹2,499.00",
+  "transactionName": "ABC Industry",
+  "transactionTime": "2025-11-25 15:47",
+  "transactionCategory": "e-commerce",
+  "transactionSource": "alibaba.com",
+  "location": "Bengaluru, India",
+  "verification_question": "What is the name of your first school?",
+  "verification_answer": "Greenwood",
+  "status": "pending_review",
+  "outcome_note": ""
+}

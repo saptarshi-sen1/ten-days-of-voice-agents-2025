@@ -1,0 +1,14 @@
+{
+  "userName": "John",
+  "security_identifier": "12345",
+  "security_question": "What is your favorite color?",
+  "security_answer": "blue",
+  "cardEnding": "4242",
+  "transactionAmount": "₹4,200",
+  "transactionName": "ABC Electronics",
+  "transactionLocation": "Bangalore",
+  "transactionTime": "2025-10-15 14:22",
+  "transactionCategory": "e-commerce",
+  "transactionSource": "flipkart.com",
+  "status": "pending_review"
+}
