@@ -1,0 +1,36 @@
+{
+  "company": "SmartPay (example)",
+  "description": "SmartPay offers a unified payments + invoicing platform for Indian SMBs.",
+  "faqs": [
+    {
+      "q": "what does your product do",
+      "a": "We provide payments, invoicing and reconciliation in one dashboard."
+    },
+    {
+      "q": "do you have a free tier",
+      "a": "Yes — a limited free tier up to 100 transactions per month."
+    },
+    {
+      "q": "who is this for",
+      "a": "Small and medium businesses, retail stores, and online sellers in India."
+    },
+    {
+      "q": "pricing",
+      "a": "We offer Free, Standard (monthly fee + per-transaction), and Enterprise plans."
+    }
+  ],
+  "pricing": [
+    {
+      "plan": "Free",
+      "details": "Up to 100 transactions / month, basic dashboard"
+    },
+    {
+      "plan": "Standard",
+      "details": "₹499/month + 1% per transaction; advanced reporting"
+    },
+    {
+      "plan": "Enterprise",
+      "details": "Custom pricing, priority support"
+    }
+  ]
+}

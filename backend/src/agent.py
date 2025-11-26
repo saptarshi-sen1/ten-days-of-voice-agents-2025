@@ -1,185 +1,355 @@
-import logging
+# agent.py — SDR Voice Agent (Day X)
+# Place at backend/src/agent.py
+
 import json
 import os
 from pathlib import Path
 from datetime import datetime
+import logging
 
 from dotenv import load_dotenv
+load_dotenv(".env.local")
+
 from livekit.agents import (
     Agent,
     AgentSession,
     JobContext,
     JobProcess,
+    MetricsCollectedEvent,
     RoomInputOptions,
     WorkerOptions,
     cli,
-    tokenize,
     metrics,
+    tokenize,
     function_tool,
-    RunContext
+    RunContext,
 )
 from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-# ----------------------------------------------------
-# ENV + GLOBALS
-# ----------------------------------------------------
-
-load_dotenv(".env.local")
 logger = logging.getLogger("agent")
+logger.setLevel(logging.INFO)
 
-BASE_DIR = Path(__file__).resolve().parent.parent  # backend/
-CONTENT_DIR = BASE_DIR / "shared-data"
-CONTENT_DIR.mkdir(exist_ok=True)
+# -----------------------
+# Paths & default content
+# -----------------------
+SRC_DIR = Path(__file__).resolve().parent        # backend/src
+BACKEND_DIR = SRC_DIR.parent                     # backend/
+CONTACTS_DIR = BACKEND_DIR / "contacts"
+SHARED_DIR = BACKEND_DIR / "shared-data"
+COMPANY_FILE = SHARED_DIR / "company_sdr.json"
 
-# ----------------------------------------------------
-# AUTO-CREATE CONTENT FILE IF MISSING
-# ----------------------------------------------------
+CONTACTS_DIR.mkdir(parents=True, exist_ok=True)
+SHARED_DIR.mkdir(parents=True, exist_ok=True)
 
-timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+DEFAULT_COMPANY = {
+    "company": "SmartPay (example)",
+    "description": "SmartPay offers a unified payments + invoicing platform for Indian SMBs.",
+    "faqs": [
+        {"q": "what does your product do", "a": "We provide payments, invoicing and reconciliation in one dashboard."},
+        {"q": "do you have a free tier", "a": "Yes — a limited free tier up to 100 transactions per month."},
+        {"q": "who is this for", "a": "Small and medium businesses, retail stores, and online sellers in India."},
+        {"q": "pricing", "a": "We offer Free, Standard (monthly fee + per-transaction), and Enterprise plans."}
+    ],
+    "pricing": [
+        {"plan": "Free", "details": "Up to 100 transactions / month, basic dashboard"},
+        {"plan": "Standard", "details": "₹499/month + 1% per transaction; advanced reporting"},
+        {"plan": "Enterprise", "details": "Custom pricing, priority support"}
+    ]
+}
 
-DEFAULT_CONTENT = [
-    {
-        "id": "variables",
-        "title": "Variables",
-        "summary": "Variables store values that you can reuse later in your program.",
-        "sample_question": "What is a variable and why is it useful?"
-    },
-    {
-        "id": "loops",
-        "title": "Loops",
-        "summary": "Loops allow repeating actions multiple times without rewriting code.",
-        "sample_question": "Explain the difference between a for loop and a while loop."
+# create company file if missing
+if not COMPANY_FILE.exists():
+    with open(COMPANY_FILE, "w", encoding="utf-8") as f:
+        json.dump(DEFAULT_COMPANY, f, indent=2, ensure_ascii=False)
+
+with open(COMPANY_FILE, "r", encoding="utf-8") as f:
+    COMPANY = json.load(f)
+
+# -----------------------
+# FAQ helper (simple)
+# -----------------------
+def find_faq_answer(query: str):
+    q = query.lower()
+    # exact substring match in question
+    for entry in COMPANY.get("faqs", []):
+        if entry.get("q") and entry["q"] in q:
+            return entry.get("a")
+    # keyword fallback (any word overlap)
+    for entry in COMPANY.get("faqs", []):
+        combined = (entry.get("q", "") + " " + entry.get("a", "")).lower()
+        if any(word for word in q.split() if word and word in combined):
+            return entry.get("a")
+    return None
+
+# -----------------------
+# Tool: save lead (NO ctx)
+# -----------------------
+@function_tool
+async def save_lead_tool(name: str,
+                         company_name: str,
+                         email: str,
+                         role: str,
+                         use_case: str,
+                         team_size: str,
+                         timeline: str) -> str:
+    """
+    Saves lead as timestamped JSON file inside backend/contacts/.
+    Returns the saved filepath string.
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    fname = f"lead_{timestamp}.json"
+    path = CONTACTS_DIR / fname
+
+    lead = {
+        "collected_at": datetime.now().isoformat(),
+        "name": name or "",
+        "company": company_name or "",
+        "email": email or "",
+        "role": role or "",
+        "use_case": use_case or "",
+        "team_size": team_size or "",
+        "timeline": timeline or "",
     }
-]
 
-# Look for an existing file
-existing_files = list(CONTENT_DIR.glob("day4_tutor_content*.json"))
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(lead, f, indent=2, ensure_ascii=False)
 
-if existing_files:
-    CONTENT_PATH = existing_files[0]
-else:
-    CONTENT_PATH = CONTENT_DIR / f"day4_tutor_content_{timestamp}.json"
-    with open(CONTENT_PATH, "w", encoding="utf-8") as f:
-        json.dump(DEFAULT_CONTENT, f, indent=2)
+    return str(path)
 
-# Load content
-with open(CONTENT_PATH, "r", encoding="utf-8") as f:
-    COURSE_CONTENT = json.load(f)
-
-# ----------------------------------------------------
-# TUTOR AGENT
-# ----------------------------------------------------
-
-class TutorAgent(Agent):
+# -----------------------
+# SDR Agent
+# -----------------------
+class SDRAgent(Agent):
     def __init__(self):
         super().__init__(
-            instructions="""
-You are an AI active recall tutor with 3 modes:
-1. learn – explain a concept using its summary.
-2. quiz – ask the user questions using sample_question.
-3. teach_back – ask the user to explain the concept back and give basic feedback.
+            instructions=f"""
+You are a friendly SDR for {COMPANY.get('company')}.
+Greet visitors warmly, ask what they're working on, focus on understanding needs,
+answer questions only from the provided FAQ/pricing content (do not invent details),
+and collect lead fields naturally: name, company, email, role, use_case, team_size, timeline.
+When the user indicates they are done (e.g. "that's all", "thanks", "I'm done"), summarize the lead and save it.
+Keep replies short, polite, and conversational.
+"""
+        )
+        # lead state
+        self.lead = {
+            "name": "",
+            "company": "",
+            "email": "",
+            "role": "",
+            "use_case": "",
+            "team_size": "",
+            "timeline": "",
+        }
+        self.collect_order = ["name", "company", "email", "role", "use_case", "team_size", "timeline"]
+        self.next_index = 0
+        self.ended = False
 
-Rules:
-• NEVER output JSON.
-• Detect mode changes from user messages.
-• ALWAYS speak with the correct Murf voice depending on mode.
-• Keep responses concise and conversational.
-""")
-
-        self.mode = None  # "learn", "quiz", "teach_back"
-        self.current_concept = None  # object from COURSE_CONTENT
-
-    # ------------------------------------------------
-    # HELPER: choose concept
-    # ------------------------------------------------
-    def find_concept(self, text: str):
-        text = text.lower()
-        for c in COURSE_CONTENT:
-            if c["id"] in text or c["title"].lower() in text:
-                return c
+    # simple helpers to extract field heuristically
+    def _extract_email(self, text: str):
+        text = text.strip()
+        if "@" in text and "." in text:
+            # take the token containing @
+            for tok in text.split():
+                if "@" in tok and "." in tok:
+                    return tok.strip(".,;")
         return None
 
-    # ------------------------------------------------
-    # TOOL: Switch learning mode
-    # ------------------------------------------------
-    @function_tool
-    async def switch_mode(self, ctx: RunContext, mode: str) -> str:
-        self.mode = mode
-        return f"Mode changed to {mode}"
+    def _extract_name_from_phrase(self, text: str):
+        # handle "my name is ..." or "i'm ...", short heuristic
+        lower = text.lower()
+        if "my name is" in lower:
+            return text.split("my name is")[-1].strip().split()[0].capitalize()
+        if lower.startswith("i am ") or lower.startswith("i'm ") or lower.startswith("im "):
+            parts = text.split()
+            # return first two tokens maybe
+            candidate = " ".join(parts[1:3]).strip()
+            return candidate.title()
+        return None
 
-    # ------------------------------------------------
-    # TOOL: Select concept
-    # ------------------------------------------------
-    @function_tool
-    async def pick_concept(self, ctx: RunContext, concept_id: str) -> str:
-        for c in COURSE_CONTENT:
-            if c["id"] == concept_id:
-                self.current_concept = c
-                return "concept_selected"
-        return "not_found"
+    def _is_end(self, text: str):
+        lower = text.lower()
+        return any(phrase in lower for phrase in ["that's all", "i'm done", "i am done", "thanks", "thank you", "bye"])
 
-    # ------------------------------------------------
-    # RESPOND TO USER
-    # ------------------------------------------------
-    async def on_user_message(self, msg, ctx):
-        text = msg.text.lower()
+    def _current_field(self):
+        if self.next_index < len(self.collect_order):
+            return self.collect_order[self.next_index]
+        return None
 
-        # Detect mode switches
-        if "learn" in text:
-            await ctx.tool_call(self.switch_mode, mode="learn")
-        elif "quiz" in text:
-            await ctx.tool_call(self.switch_mode, mode="quiz")
-        elif "teach" in text or "teach back" in text:
-            await ctx.tool_call(self.switch_mode, mode="teach_back")
+    def _advance_field(self):
+        self.next_index = min(self.next_index + 1, len(self.collect_order))
 
-        # Detect concept selection
-        concept = self.find_concept(text)
-        if concept:
-            await ctx.tool_call(self.pick_concept, concept_id=concept["id"])
+    # main message handler
+    async def on_user_message(self, msg, ctx: RunContext):
+        text = (msg.text or "").strip()
+        lower = text.lower()
 
-        # If mode or concept missing → ask user
-        if not self.mode:
-            await ctx.llm_response("Welcome! Would you like to Learn, Quiz, or Teach Back?")
+        # End of call detection
+        if self._is_end(text):
+            # Save and respond summary
+            filepath = await ctx.tool_call(save_lead_tool,
+                                           name=self.lead["name"],
+                                           company_name=self.lead["company"],
+                                           email=self.lead["email"],
+                                           role=self.lead["role"],
+                                           use_case=self.lead["use_case"],
+                                           team_size=self.lead["team_size"],
+                                           timeline=self.lead["timeline"])
+            # build summary
+            parts = []
+            if self.lead["name"]:
+                parts.append(f"Name: {self.lead['name']}")
+            if self.lead["company"]:
+                parts.append(f"Company: {self.lead['company']}")
+            if self.lead["email"]:
+                parts.append(f"Email: {self.lead['email']}")
+            if self.lead["role"]:
+                parts.append(f"Role: {self.lead['role']}")
+            if self.lead["use_case"]:
+                parts.append(f"Use case: {self.lead['use_case']}")
+            if self.lead["team_size"]:
+                parts.append(f"Team size: {self.lead['team_size']}")
+            if self.lead["timeline"]:
+                parts.append(f"Timeline: {self.lead['timeline']}")
+            summary = "; ".join(parts) if parts else "No lead details collected."
+            await ctx.llm_response(f"Thanks — quick summary: {summary} I saved this to {filepath}. We'll reach out soon. Bye!")
+            self.ended = True
             return
 
-        if not self.current_concept:
-            await ctx.llm_response("Great! Which topic? You can choose variables or loops.")
+        # If user asks pricing/product/company -> use FAQ (no hallucination)
+        if any(k in lower for k in ["price", "pricing", "cost", "free tier", "what does", "what is", "who is this for", "who is this"]):
+            ans = find_faq_answer(lower)
+            if ans:
+                await ctx.llm_response(ans)
+                return
+            else:
+                await ctx.llm_response("I don't have that detail in the FAQ — would you like me to connect you with someone from sales?")
+                return
+
+        # Attempt to fill fields from the current message
+        cur = self._current_field()
+
+        # Try to extract name
+        if cur == "name":
+            name = self._extract_name_from_phrase(text)
+            if name:
+                self.lead["name"] = name
+                self._advance_field()
+            else:
+                # If message is short and likely a name, accept it
+                if 1 <= len(text.split()) <= 3 and len(text) < 40:
+                    self.lead["name"] = text.title()
+                    self._advance_field()
+                else:
+                    await ctx.llm_response("Hi — can I get your name for the order?")
+                    return
+
+        # company
+        if self._current_field() == "company":
+            # accept short response
+            if len(text.split()) <= 6:
+                self.lead["company"] = text.title()
+                self._advance_field()
+            else:
+                await ctx.llm_response("Which company are you with?")
+                return
+
+        # email
+        if self._current_field() == "email":
+            email = self._extract_email(text)
+            if email:
+                self.lead["email"] = email
+                self._advance_field()
+            else:
+                await ctx.llm_response("What's the best email to reach you at?")
+                return
+
+        # role
+        if self._current_field() == "role":
+            if len(text.split()) <= 6:
+                self.lead["role"] = text.title()
+                self._advance_field()
+            else:
+                await ctx.llm_response("What's your role there?")
+                return
+
+        # use_case
+        if self._current_field() == "use_case":
+            # allow long text here
+            self.lead["use_case"] = text
+            self._advance_field()
+
+        # team_size
+        if self._current_field() == "team_size":
+            # try to pick number/token
+            tokens = text.split()
+            picked = None
+            for tok in tokens:
+                if tok.isdigit():
+                    picked = tok
+                    break
+            if not picked:
+                # map words
+                if any(w in lower for w in ["small", "solo", "one", "two", "three", "few"]):
+                    picked = "1-5"
+            if picked:
+                self.lead["team_size"] = picked
+                self._advance_field()
+            else:
+                await ctx.llm_response("Roughly how large is your team? (e.g., 1-5, 10-50)")
+                return
+
+        # timeline
+        if self._current_field() == "timeline":
+            if any(w in lower for w in ["now", "immediately", "soon", "later", "next", "month"]):
+                if "now" in lower or "immediately" in lower:
+                    self.lead["timeline"] = "now"
+                elif "soon" in lower or "next" in lower or "week" in lower:
+                    self.lead["timeline"] = "soon"
+                else:
+                    self.lead["timeline"] = "later"
+                self._advance_field()
+            else:
+                # accept short answers
+                if len(text.split()) <= 6:
+                    self.lead["timeline"] = text
+                    self._advance_field()
+                else:
+                    await ctx.llm_response("What's your timeline to start? (now / soon / later)")
+                    return
+
+        # After processing, if there are more fields to ask, prompt next
+        next_field = self._current_field()
+        if next_field:
+            prompts = {
+                "name": "May I have your full name?",
+                "company": "Which company are you with?",
+                "email": "What's the best email to reach you at?",
+                "role": "What's your role there?",
+                "use_case": "What would you like to use our product for?",
+                "team_size": "How big is your team (approx.)?",
+                "timeline": "What's your timeline to start? (now / soon / later)"
+            }
+            await ctx.llm_response(prompts.get(next_field, "Could you provide that detail?"))
             return
 
-        # -------------------- MODE: LEARN --------------------
-        if self.mode == "learn":
-            ctx.session.tts.voice = "en-US-matthew"  # Matthew
-            summary = self.current_concept["summary"]
-            await ctx.llm_response(f"Here's a quick explanation: {summary}")
+        # If we've got everything and user hasn't said 'done' yet, ask to confirm or say next steps
+        if not self.ended and all(self.lead.get(k) for k in ["name", "email", "role", "use_case"]):
+            await ctx.llm_response("Thanks — I've got your details. If you'd like, say 'that's all' to finish and I'll save this. Would you like to add anything else?")
             return
 
-        # -------------------- MODE: QUIZ --------------------
-        elif self.mode == "quiz":
-            ctx.session.tts.voice = "en-US-alicia"  # Alicia
-            question = self.current_concept["sample_question"]
-            await ctx.llm_response(f"Alright! Here's your question: {question}")
-            return
+        # Fallback
+        await ctx.llm_response("Sorry, I didn't catch that. Could you rephrase? You can also ask product or pricing questions.")
 
-        # -------------------- MODE: TEACH BACK --------------------
-        elif self.mode == "teach_back":
-            ctx.session.tts.voice = "en-US-ken"  # Ken
-            question = self.current_concept["sample_question"]
-            await ctx.llm_response(
-                f"Great! Teach this back to me: {question}. I'll tell you how clearly you explained it."
-            )
-            return
-
-
-# ----------------------------------------------------
-# SESSION CONFIG + ENTRYPOINT
-# ----------------------------------------------------
-
+# -----------------------
+# Prewarm + Entry point
+# -----------------------
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
 
 async def entrypoint(ctx: JobContext):
-    ctx.log_context = {"room": ctx.room.name}
+    ctx.log_context_fields = {"room": ctx.room.name}
 
     session = AgentSession(
         stt=deepgram.STT(model="nova-3"),
@@ -187,26 +357,35 @@ async def entrypoint(ctx: JobContext):
         tts=murf.TTS(
             voice="en-US-matthew",
             style="Conversation",
-            tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2)
+            tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
+            text_pacing=True
         ),
-        vad=ctx.proc.userdata["vad"],
         turn_detection=MultilingualModel(),
-        preemptive_generation=True
+        vad=ctx.proc.userdata["vad"],
+        preemptive_generation=True,
     )
 
+    usage_collector = metrics.UsageCollector()
+
+    @session.on("metrics_collected")
+    def _on_metrics_collected(ev: MetricsCollectedEvent):
+        metrics.log_metrics(ev.metrics)
+        usage_collector.collect(ev.metrics)
+
+    async def log_usage():
+        logger.info(f"Usage: {usage_collector.get_summary()}")
+
+    ctx.add_shutdown_callback(log_usage)
+
     await session.start(
-        agent=TutorAgent(),
+        agent=SDRAgent(),
         room=ctx.room,
         room_input_options=RoomInputOptions(
-            noise_cancellation=noise_cancellation.BVC()
-        )
+            noise_cancellation=noise_cancellation.BVC(),
+        ),
     )
 
     await ctx.connect()
 
-
-
 if __name__ == "__main__":
-    cli.run_app(
-        WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm)
-    )
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
