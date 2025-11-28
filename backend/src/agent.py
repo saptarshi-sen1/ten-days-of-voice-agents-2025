@@ -1,230 +1,237 @@
-# backend/src/agent.py
+import logging
 import json
-import os
 from pathlib import Path
 from datetime import datetime
-import logging
-from dotenv import load_dotenv
+import uuid
 
+from dotenv import load_dotenv
 from livekit.agents import (
     Agent,
     AgentSession,
     JobContext,
     JobProcess,
-    MetricsCollectedEvent,
     RoomInputOptions,
     WorkerOptions,
     cli,
-    metrics,
-    tokenize,
+    function_tool,
+    RunContext,
+    tokenize
 )
 from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-load_dotenv(".env.local")
 logger = logging.getLogger("agent")
-logger.setLevel(logging.INFO)
+load_dotenv(".env.local")
 
-# -----------------------
-# Paths & helpers
-# -----------------------
-ROOT = Path(__file__).resolve().parent.parent  # backend/
-CASES_DIR = ROOT / "fraud_cases"
-CASES_DIR.mkdir(exist_ok=True)
+# ----------------------------
+# File paths
+# ----------------------------
+CATALOG_FILE = Path("catalog.json")
+CURRENT_CART_FILE = Path("current_cart.json")
+ORDER_HISTORY_FILE = Path("order_history.json")
+TRACKING_FILE = Path("order_tracking.json")
 
-def case_path_for(name_token: str) -> Path:
-    """Return path for a case file corresponding to `name_token` (lowercased)."""
-    return CASES_DIR / f"{name_token.lower()}.json"
+# ----------------------------
+# Shopping state
+# ----------------------------
+class ShoppingState:
+    def __init__(self):
+        self.cart = self.load_cart()
 
-def load_case_for(name_token: str):
-    p = case_path_for(name_token)
-    if not p.exists():
-        return None
-    with open(p, "r", encoding="utf-8") as f:
-        return json.load(f)
+    def load_cart(self):
+        if CURRENT_CART_FILE.exists():
+            try:
+                with open(CURRENT_CART_FILE, "r") as f:
+                    return json.load(f)
+            except:
+                return {}
+        return {}
 
-def save_case_for(name_token: str, data: dict):
-    p = case_path_for(name_token)
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    logger.info(f"Saved case: {p}")
+    def save_cart(self):
+        with open(CURRENT_CART_FILE, "w") as f:
+            json.dump(self.cart, f, indent=2)
 
-def normalize_text(s: str) -> str:
-    return "".join(ch for ch in (s or "").strip().lower() if ch.isalnum() or ch.isspace()).strip()
+    def add_item(self, item: str, qty: int):
+        self.cart[item] = self.cart.get(item, 0) + qty
+        self.save_cart()
 
-# -----------------------
-# Example schema for fraud case (for reference)
-# {
-#   "userName": "John",
-#   "securityIdentifier": "12345",
-#   "verification_question": "What is your favorite color?",
-#   "verification_answer": "blue",
-#   "cardEnding": "4242",
-#   "transactionAmount": "₹4,200",
-#   "transactionName": "ABC Electronics",
-#   "transactionLocation": "Bangalore",
-#   "transactionTime": "2025-10-15 14:22",
-#   "transactionCategory": "e-commerce",
-#   "transactionSource": "flipkart.com",
-#   "status": "pending_review",
-#   "note": ""
-# }
-# -----------------------
+    def remove_item(self, item: str):
+        if item in self.cart:
+            del self.cart[item]
+            self.save_cart()
 
-class FraudAgent(Agent):
+    def list_cart(self):
+        if not self.cart:
+            return "Your cart is empty."
+        msg = "Your cart:\n"
+        for item, qty in self.cart.items():
+            msg += f"- {item}: {qty}\n"
+        return msg
+
+    def reset(self):
+        self.cart = {}
+        self.save_cart()
+
+# ----------------------------
+# Recipes
+# ----------------------------
+RECIPES = {
+    "peanut butter sandwich": ["bread", "peanut butter"],
+    "pasta": ["pasta", "pasta sauce"],
+    "maggi": ["maggi noodles", "water bottle"],
+    "omelette": ["eggs", "milk", "salt", "pepper"],
+    "grilled cheese": ["bread", "cheese", "butter"],
+}
+
+# ----------------------------
+# Shopping Agent
+# ----------------------------
+class ShoppingAgent(Agent):
     def __init__(self):
         super().__init__(
-            instructions=(
-                "You are a calm, professional fraud-prevention assistant for a bank. "
-                "When a session starts, greet the user, ask for their registered name, "
-                "verify using the exact stored verification question, and then read the suspicious "
-                "transaction details. Ask yes/no if they made it; update the case JSON with "
-                "confirmed_safe / confirmed_fraud / verification_failed and add a short note. "
-                "Keep answers short and polite."
-            ),
+            instructions="""
+You are a friendly food & grocery ordering assistant.
+You can add/remove items, list the cart, add ingredients for recipes, place orders, and track orders.
+"""
         )
-        # conversation state per job/instance:
-        self.case = None
-        self.case_name_token = None
-        self.stage = "await_name"  # await_name -> await_verification -> await_confirm -> done
+        self.state = ShoppingState()
+        self.catalog = {}
+        if CATALOG_FILE.exists():
+            try:
+                with open(CATALOG_FILE, "r") as f:
+                    self.catalog = {k.lower(): v for k, v in json.load(f).items()}
+            except:
+                self.catalog = {}
 
+        print("Catalog loaded:", self.catalog.keys())
+
+    # ------------------------- TOOLS -------------------------
+    @function_tool
+    async def add_item_to_cart(self, ctx: RunContext, item: str, quantity: int) -> str:
+        item = item.lower()
+        if item not in self.catalog:
+            return f"I am sorry, I cannot fulfill this request. '{item}' is not in the catalog."
+        self.state.add_item(item, quantity)
+        return f"Added {quantity} x {item} to your cart."
+
+    @function_tool
+    async def remove_item(self, ctx: RunContext, item: str) -> str:
+        item = item.lower()
+        self.state.remove_item(item)
+        return f"Removed {item} from your cart."
+
+    @function_tool
+    async def show_cart(self, ctx: RunContext) -> str:
+        return self.state.list_cart()
+
+    @function_tool
+    async def add_recipe_ingredients(self, ctx: RunContext, dish: str) -> str:
+        dish = dish.lower()
+        if dish not in RECIPES:
+            return f"I don't know the recipe for {dish}."
+        added = []
+        for item in RECIPES[dish]:
+            if item in self.catalog:
+                self.state.add_item(item, 1)
+                added.append(item)
+        return f"Ingredients for {dish} have been added to your cart: {', '.join(added)}"
+
+    @function_tool
+    async def place_order(self, ctx: RunContext) -> str:
+        if not self.state.cart:
+            return "Your cart is empty. Please add items before placing an order."
+
+        order_id = str(uuid.uuid4())[:8]
+        total = sum(self.catalog[item]["price"] * qty for item, qty in self.state.cart.items())
+
+        order = {
+            "order_id": order_id,
+            "timestamp": datetime.now().isoformat(),
+            "items": [
+                {
+                    "name": item,
+                    "quantity": qty,
+                    "unit_price": self.catalog[item]["price"],
+                    "total_price": self.catalog[item]["price"] * qty
+                }
+                for item, qty in self.state.cart.items()
+            ],
+            "order_total": total
+        }
+
+        # Save history
+        history = []
+        if ORDER_HISTORY_FILE.exists():
+            try:
+                with open(ORDER_HISTORY_FILE, "r") as f:
+                    history = json.load(f)
+            except:
+                history = []
+        history.append(order)
+        with open(ORDER_HISTORY_FILE, "w") as f:
+            json.dump(history, f, indent=2)
+
+        # Save tracking
+        tracking = {}
+        if TRACKING_FILE.exists():
+            try:
+                with open(TRACKING_FILE, "r") as f:
+                    tracking = json.load(f)
+            except:
+                tracking = {}
+        tracking[order_id] = {"status": "Order Placed", "last_updated": datetime.now().isoformat()}
+        with open(TRACKING_FILE, "w") as f:
+            json.dump(tracking, f, indent=2)
+
+        self.state.reset()
+        return f"Order {order_id} placed! Total ₹{total}."
+
+    @function_tool
+    async def track_order(self, ctx: RunContext, order_id: str) -> str:
+        tracking = {}
+        if TRACKING_FILE.exists():
+            try:
+                with open(TRACKING_FILE, "r") as f:
+                    tracking = json.load(f)
+            except:
+                tracking = {}
+        if order_id not in tracking:
+            return "Order ID not found."
+        return f"Status for {order_id}: {tracking[order_id]['status']}"
+
+    # ------------------------- MESSAGE HANDLER -------------------------
     async def on_user_message(self, msg, ctx):
-        """
-        msg.text is the user's transcribed text for spoken input / typed input.
-        ctx.llm_response(text) sends the agent's reply back (and will be TTS-ed).
-        """
-        text = (msg.text or "").strip()
-        lower = text.lower()
+        text = msg.text.lower()
 
-        # Stage: ask for name (if we haven't)
-        if self.stage == "await_name":
-            # If user provided a name in the first utterance, try to load case.
-            # We'll take the first token as the key (common in prior examples).
-            if not text:
-                await ctx.llm_response("Hello — may I have the registered account name, please?")
-                return
-
-            name_token = text.split()[0]
-            case = load_case_for(name_token)
-            if case is None:
-                # fallback: try exact match for whole phrase as filename
-                case = load_case_for(text.replace(" ", "_"))
-                if case is None:
-                    # ask to re-provide name
-                    await ctx.llm_response(
-                        "I couldn't find a record under that name. Please tell me the registered name on your account."
-                    )
+        # Commands
+        if "cart" in text:
+            await ctx.llm_response(self.state.list_cart())
+            return
+        elif "place order" in text or "checkout" in text:
+            await ctx.tool_call(self.place_order)
+            return
+        elif "track" in text:
+            words = text.split()
+            for word in words:
+                if len(word) == 8:  # assume order_id
+                    await ctx.tool_call(self.track_order, order_id=word)
                     return
-
-            # found case
-            self.case = case
-            self.case_name_token = name_token
-            self.stage = "await_verification"
-
-            # ask verification question from case
-            vq = case.get("verification_question") or case.get("security_question") or "Please provide a verification answer."
-            await ctx.llm_response(f"Thank you — to verify your identity: {vq}")
+        elif text.startswith("i want to make") or text.startswith("ingredients for"):
+            # recipe request
+            dish = text.replace("i want to make", "").replace("ingredients for", "").strip()
+            await ctx.tool_call(self.add_recipe_ingredients, dish=dish)
             return
+        else:
+            await ctx.llm_response("How can I help you with your shopping today?")
 
-        # Stage: verification
-        if self.stage == "await_verification":
-            if not self.case:
-                self.stage = "await_name"
-                await ctx.llm_response("Sorry, I lost the case. Please provide your registered name again.")
-                return
-
-            expected_raw = str(self.case.get("verification_answer") or self.case.get("security_answer") or "").strip()
-            if not expected_raw:
-                # no verification data, fail safe
-                self.case["status"] = "verification_failed"
-                self.case["note"] = "No verification question/answer stored."
-                save_case_for(self.case_name_token, self.case)
-                await ctx.llm_response("I cannot verify your identity at this time. Please contact the bank directly.")
-                self.stage = "done"
-                return
-
-            given_norm = normalize_text(text)
-            expected_norm = normalize_text(expected_raw)
-
-            if given_norm == expected_norm:
-                # verified
-                self.stage = "await_confirm"
-                # read suspicious transaction details
-                txn_name = self.case.get("transactionName") or self.case.get("merchant") or "unknown merchant"
-                txn_amt = self.case.get("transactionAmount") or self.case.get("amount") or "unknown amount"
-                txn_time = self.case.get("transactionTime") or self.case.get("date") or "unknown time"
-                txn_loc = self.case.get("transactionLocation") or self.case.get("transactionLocation") or ""
-                card_end = self.case.get("cardEnding") or self.case.get("cardEnding")
-                reply = (
-                    f"Thank you — verification passed. We detected a suspicious transaction: "
-                    f"{txn_name} for {txn_amt}"
-                )
-                if card_end:
-                    reply += f" on card ending {card_end}"
-                if txn_time:
-                    reply += f" at {txn_time}"
-                if txn_loc:
-                    reply += f" in {txn_loc}"
-                reply += ". Did you make this transaction? Please answer yes or no."
-
-                await ctx.llm_response(reply)
-                return
-            else:
-                # verification failed (strict)
-                self.case["status"] = "verification_failed"
-                self.case["note"] = f"Verification failed. Provided: {text}"
-                save_case_for(self.case_name_token, self.case)
-                await ctx.llm_response(
-                    "I'm sorry — that answer does not match our records. For your security, I cannot continue. Please contact the bank."
-                )
-                self.stage = "done"
-                return
-
-        # Stage: confirmation (yes/no)
-        if self.stage == "await_confirm":
-            if not self.case:
-                self.stage = "await_name"
-                await ctx.llm_response("I couldn't find the case — please provide your registered name.")
-                return
-
-            if any(tok in lower for tok in ["yes", "yep", "yeah", "y"]):
-                self.case["status"] = "confirmed_safe"
-                self.case["note"] = "Customer confirmed transaction as legitimate."
-                save_case_for(self.case_name_token, self.case)
-                await ctx.llm_response("Thank you. I have marked this transaction as legitimate and closed the case. Have a nice day.")
-                self.stage = "done"
-                return
-
-            if any(tok in lower for tok in ["no", "nope", "nah", "n"]):
-                self.case["status"] = "confirmed_fraud"
-                self.case["note"] = "Customer denied the transaction. Mock card block issued and dispute created."
-                # optionally add timestamped actions
-                action_note = f"Mock card block issued and dispute created at {datetime.utcnow().isoformat()}Z"
-                self.case.setdefault("actions", []).append(action_note)
-                save_case_for(self.case_name_token, self.case)
-                await ctx.llm_response(
-                    "Understood. I have flagged the transaction as fraudulent, issued a mock card block, and created a dispute. Our fraud team will follow up. Stay safe."
-                )
-                self.stage = "done"
-                return
-
-            # unclear answer
-            await ctx.llm_response("Please answer clearly with 'yes' or 'no'.")
-            return
-
-        # If done or unknown stage
-        await ctx.llm_response("Thank you. If you need anything else, contact your bank's support.")
-
-# -----------------------
-# Prewarm + entrypoint
-# -----------------------
-
+# ----------------------------
+# PREWARM + ENTRYPOINT
+# ----------------------------
 def prewarm(proc: JobProcess):
-    # load VAD once
     proc.userdata["vad"] = silero.VAD.load()
 
 async def entrypoint(ctx: JobContext):
-    ctx.log_context_fields = {"room": ctx.room.name}
+    ctx.add_shutdown_callback(lambda: logger.info("Agent shutting down."))
 
     session = AgentSession(
         stt=deepgram.STT(model="nova-3"),
@@ -240,28 +247,17 @@ async def entrypoint(ctx: JobContext):
         preemptive_generation=True,
     )
 
-    usage_collector = metrics.UsageCollector()
-
-    @session.on("metrics_collected")
-    def _on_metrics_collected(ev: MetricsCollectedEvent):
-        metrics.log_metrics(ev.metrics)
-        usage_collector.collect(ev.metrics)
-
-    async def log_usage():
-        summary = usage_collector.get_summary()
-        logger.info(f"Usage summary: {summary}")
-
-    ctx.add_shutdown_callback(log_usage)
-
     await session.start(
-        agent=FraudAgent(),
+        agent=ShoppingAgent(),
         room=ctx.room,
         room_input_options=RoomInputOptions(
             noise_cancellation=noise_cancellation.BVC(),
         ),
     )
-
     await ctx.connect()
 
+# ----------------------------
+# MAIN
+# ----------------------------
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))

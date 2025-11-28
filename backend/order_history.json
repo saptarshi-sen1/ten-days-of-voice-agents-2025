@@ -1,0 +1,21 @@
+[
+  {
+    "order_id": "9f9a1c3a",
+    "timestamp": "2025-11-28T12:23:00.497396",
+    "items": [
+      {
+        "name": "pasta",
+        "quantity": 2,
+        "unit_price": 100,
+        "total_price": 200
+      },
+      {
+        "name": "pasta sauce",
+        "quantity": 1,
+        "unit_price": 80,
+        "total_price": 80
+      }
+    ],
+    "order_total": 280
+  }
+]
