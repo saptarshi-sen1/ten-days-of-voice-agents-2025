@@ -25,183 +25,159 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel
 logger = logging.getLogger("agent")
 load_dotenv(".env.local")
 
-LOG_PATH = Path("wellness_log.json")
-
-
 # -------------------------------------------------
-#   WELLNESS STATE MACHINE
+#   ORDER STATE MACHINE
 # -------------------------------------------------
 
-class WellnessState:
+class CoffeeOrderState:
     def __init__(self):
-        self.reset()
-
-    def reset(self):
         self.state = {
-            "timestamp": None,
-            "mood": None,
-            "energy": None,
-            "stress": None,
-            "goals": [],
-            "summary": None,
+            "drinkType": "",
+            "size": "",
+            "milk": "",
+            "extras": [],
+            "name": ""
         }
 
     def is_complete(self):
         return (
-            self.state["mood"] is not None
-            and self.state["energy"] is not None
-            and self.state["stress"] is not None
-            and len(self.state["goals"]) > 0
+            self.state["drinkType"]
+            and self.state["size"]
+            and self.state["milk"]
+            and self.state["name"]
         )
 
     def next_question(self):
-        if self.state["mood"] is None:
-            return "How are you feeling today overall?"
-        if self.state["energy"] is None:
-            return "How would you describe your energy level today? Low, medium, or high?"
-        if self.state["stress"] is None:
-            return "And how are your stress levels right now?"
-        if len(self.state["goals"]) == 0:
-            return "What are 1–3 simple goals you want to aim for today?"
+        if not self.state["drinkType"]:
+            return "What drink would you like? For example latte, cappuccino, americano, or mocha?"
+        if not self.state["size"]:
+            return "What size would you like? Small, medium, or large?"
+        if not self.state["milk"]:
+            return "What type of milk should I use? Whole, skim, oat, almond, or soy?"
+        if not self.state["name"]:
+            return "May I know your name?"
         return None
 
 
 # -------------------------------------------------
-#   DAY 3 WELLNESS AGENT
+#   BARISTA AGENT WITH GEMINI TOOLS
 # -------------------------------------------------
 
-class WellnessAgent(Agent):
+class BaristaAgent(Agent):
+
     def __init__(self):
         super().__init__(
             instructions="""
-You are a supportive, realistic wellness companion.
-You do NOT diagnose, treat, or give medical advice.
+You are a friendly barista taking a coffee order for Moonbeam Coffee.
 
-Your tasks:
-1. Ask one question at a time: mood → energy → stress → goals.
-2. Use the tools to record data.
-3. When all fields are filled, call save_checkin().
-4. Offer brief, simple, grounded suggestions only (e.g., take a short break, split tasks).
-5. Reference past data from the JSON log when useful.
+Your job:
+1. Ask one question at a time (drinkType → size → milk → name).
+2. When the user answers, call update_order(field, value).
+3. If they mention an add-on such as sugar, ice, vanilla, caramel, cinnamon, or cream, call update_order("extras", that_extra).
+4. When all fields are filled, call save_order().
+5. After saving, tell the user the order summary and that you're preparing their drink.
 
-Never output JSON directly. Always use the provided tools.
+Important:
+- Never output JSON.
+- Always use the tools to modify or save the order.
+
 """
         )
-        self.state = WellnessState()
 
-    # ------------------------- TOOLS -------------------------
+        self.order = CoffeeOrderState()
+
+    # -------- TOOL: Update order fields --------
 
     @function_tool
-    async def update_field(self, ctx: RunContext, field: str, value: str) -> str:
-        """Update a field in today's check-in session."""
-        if field == "goals":
-            self.state.state["goals"].append(value)
+    async def update_order(self, ctx: RunContext, field: str, value: str) -> str:
+        """
+        Update a single field in the customer's coffee order.
+        Valid fields: drinkType, size, milk, extras, name
+        """
+        if field == "extras":
+            self.order.state["extras"].append(value)
         else:
-            self.state.state[field] = value
+            self.order.state[field] = value
         return "updated"
 
-    @function_tool
-    async def save_checkin(self, ctx: RunContext) -> str:
-        """Save a completed daily check-in to wellness_log.json"""
-
-        # Fill timestamp
-        self.state.state["timestamp"] = datetime.now().isoformat()
-
-        # Load old log
-        data = []
-        if LOG_PATH.exists():
-            try:
-                with open(LOG_PATH, "r") as f:
-                    data = json.load(f)
-            except:
-                data = []
-
-        # Append
-        data.append(self.state.state)
-
-        # Write back
-        with open(LOG_PATH, "w") as f:
-            json.dump(data, f, indent=2)
-
-        return "saved"
+    # -------- TOOL: Save order to JSON --------
 
     @function_tool
-    async def load_history(self, ctx: RunContext) -> str:
-        """Load previous check-ins and return a short summary string"""
-        if not LOG_PATH.exists():
-            return "no_history"
+    async def save_order(self, ctx: RunContext) -> str:
+        """
+        Save the completed order into a timestamped JSON file.
+        Returns the file path.
+        """
+        os.makedirs("orders", exist_ok=True)
 
-        try:
-            with open(LOG_PATH, "r") as f:
-                data = json.load(f)
-        except:
-            return "no_history"
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        filepath = f"orders/order_{timestamp}.json"
 
-        if not data:
-            return "no_history"
+        with open(filepath, "w") as f:
+            json.dump(self.order.state, f, indent=2)
 
-        last = data[-1]
-        summary = f"Last time you were feeling {last.get('mood', 'unknown')} with {last.get('energy', 'unknown')} energy."
-        return summary
+        return filepath
 
-    # ------------------------- MESSAGE HANDLER -------------------------
+    # -------- Handle user messages --------
 
     async def on_user_message(self, msg, ctx):
-        text = msg.text.strip().lower()
+        text = msg.text.lower()
 
-        # Simple parsing
-        mood_words = ["happy", "sad", "okay", "fine", "good", "bad", "neutral"]
-        energy_words = ["low", "medium", "high"]
-        stress_words = ["low", "medium", "high"]
+        # Mapping for simple detection
+        drink_keywords = ["latte", "cappuccino", "americano", "mocha", "espresso", "cold brew"]
+        size_keywords = ["small", "medium", "large"]
+        milk_keywords = ["whole", "skim", "oat", "almond", "soy"]
+        extra_keywords = ["sugar", "ice", "vanilla", "caramel", "cinnamon", "cream"]
 
-        # MOOD
-        for m in mood_words:
-            if m in text and self.state.state["mood"] is None:
-                await ctx.tool_call(self.update_field, field="mood", value=m)
+        # DRINK TYPE
+        for d in drink_keywords:
+            if d in text:
+                await ctx.tool_call(self.update_order, field="drinkType", value=d)
                 break
 
-        # ENERGY
-        for e in energy_words:
-            if e in text and self.state.state["energy"] is None:
-                await ctx.tool_call(self.update_field, field="energy", value=e)
+        # SIZE
+        for s in size_keywords:
+            if s in text:
+                await ctx.tool_call(self.update_order, field="size", value=s)
                 break
 
-        # STRESS
-        for s in stress_words:
-            if s in text and self.state.state["stress"] is None:
-                await ctx.tool_call(self.update_field, field="stress", value=s)
+        # MILK
+        for m in milk_keywords:
+            if m in text:
+                await ctx.tool_call(self.update_order, field="milk", value=m)
                 break
 
-        # GOALS – detect sentences starting with "i want", "i will", etc.
-        if any(x in text for x in ["i want", "i will", "i plan", "my goal"]):
-            cleaned = text.replace("i want to", "").replace("i want", "")
-            cleaned = cleaned.replace("i will", "").replace("my goal is", "").strip()
-            if cleaned:
-                await ctx.tool_call(self.update_field, field="goals", value=cleaned)
+        # EXTRAS
+        for e in extra_keywords:
+            if e in text:
+                await ctx.tool_call(self.update_order, field="extras", value=e)
 
-        # Ask next question
-        if not self.state.is_complete():
-            await ctx.llm_response(self.state.next_question())
+        # NAME — detect "my name is X"
+        if "my name is" in text:
+            name = text.split("my name is")[-1].strip().split()[0]
+            name = name.capitalize()
+            await ctx.tool_call(self.update_order, field="name", value=name)
+
+        # Ask next question if incomplete
+        if not self.order.is_complete():
+            await ctx.llm_response(self.order.next_question())
             return
 
-        # All complete → save JSON
-        await ctx.tool_call(self.save_checkin)
+        # SAVE ORDER using tool
+        filepath = await ctx.tool_call(self.save_order)
 
-        # Create summary safely
-        st = self.state.state
-        goals_text = ", ".join(st["goals"])
-
+        # Respond with summary
+        o = self.order.state
         summary = (
-            f"Thanks! Today you're feeling {st['mood']}, "
-            f"your energy is {st['energy']}, and your stress is {st['stress']}. "
-            f"Your goals are: {goals_text}. "
-            "A small tip: break these into small steps and take brief pauses."
+            f"Thanks {o['name']}! So that's a {o['size']} {o['drinkType']} with {o['milk']} milk"
         )
 
-        await ctx.llm_response(summary)
+        if o["extras"]:
+            summary += f" and extra " + ", ".join(o["extras"])
 
-        # Reset for next session
-        self.state.reset()
+        summary += ". I'm preparing your drink now!"
+
+        await ctx.llm_response(summary)
 
 
 # -------------------------------------------------
@@ -222,7 +198,7 @@ async def entrypoint(ctx: JobContext):
             voice="en-US-matthew",
             style="Conversation",
             tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
-            text_pacing=True,
+            text_pacing=True
         ),
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
@@ -242,7 +218,7 @@ async def entrypoint(ctx: JobContext):
     ctx.add_shutdown_callback(log_usage)
 
     await session.start(
-        agent=WellnessAgent(),
+        agent=BaristaAgent(),
         room=ctx.room,
         room_input_options=RoomInputOptions(
             noise_cancellation=noise_cancellation.BVC(),

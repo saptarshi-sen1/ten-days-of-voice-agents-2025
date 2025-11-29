@@ -1,12 +1,4 @@
-{
-  "bread": {"price": 20},
-  "peanut butter": {"price": 150},
-  "pasta": {"price": 100},
-  "pasta sauce": {"price": 80},
-  "maggi noodles": {"price": 25},
-  "eggs": {"price": 60},
-  "milk": {"price": 50},
-  "cheese": {"price": 120},
-  "butter": {"price": 90},
-  "water bottle": {"price": 15}
-}
+[
+  {"id":"mug-001","name":"Stoneware Coffee Mug","description":"A sturdy stoneware mug (350ml).","price":800,"currency":"INR","category":"mug","color":"white"},
+  {"id":"mug-002","name":"Blue Ceramic Mug","description":"Blue glazed ceramic mug (300ml).","price":650,"currency":"INR","category":"mug","color":"blue"}
+]
