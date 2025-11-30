@@ -25,174 +25,166 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel
 logger = logging.getLogger("agent")
 load_dotenv(".env.local")
 
-# -------------------------------------------------
-#   SAMPLE PRODUCT CATALOG
-# -------------------------------------------------
-
-CATALOG = [
-    {"id": "mug-001", "name": "Stoneware Coffee Mug", "category": "mug", "price": 800, "currency": "INR", "color": "white"},
-    {"id": "mug-002", "name": "Black Ceramic Mug", "category": "mug", "price": 650, "currency": "INR", "color": "black"},
-    {"id": "hoodie-001", "name": "Blue Hoodie", "category": "hoodie", "price": 1200, "currency": "INR", "color": "blue"},
-    {"id": "hoodie-002", "name": "Black Premium Hoodie", "category": "hoodie", "price": 1500, "currency": "INR", "color": "black"},
-    {"id": "shirt-001", "name": "Graphic T-Shirt", "category": "tshirt", "price": 900, "currency": "INR", "color": "white"},
-]
-
-ORDERS_DIR = "orders"
-os.makedirs(ORDERS_DIR, exist_ok=True)
 
 # -------------------------------------------------
-#   ORDER STATE MACHINE
+#   PRODUCT CATALOG
 # -------------------------------------------------
 
-class OrderState:
+PRODUCT_CATALOG = {
+    "laptop": 55000,
+    "mouse": 800,
+    "keyboard": 1200,
+    "monitor": 9000,
+    "headphones": 2500,
+    "speakers": 1800,
+    "webcam": 1500,
+    "pendrive": 600,
+}
+
+
+# -------------------------------------------------
+#   ORDER SYSTEM WITH TIMESTAMPS
+# -------------------------------------------------
+
+class OrderSystem:
     def __init__(self):
-        self.state = {
-            "product_id": "",
-            "quantity": 1,
-            "name": ""
+        self.current_order = []      # list of item entries
+        self.order_history = self.load_history()
+
+    def load_history(self):
+        if not os.path.exists("orders.json"):
+            return []
+        try:
+            with open("orders.json", "r") as f:
+                return json.load(f)
+        except:
+            return []
+
+    def save_history(self):
+        with open("orders.json", "w") as f:
+            json.dump(self.order_history, f, indent=2)
+
+    def add_item(self, item, qty):
+        price = PRODUCT_CATALOG.get(item, 0)
+
+        entry = {
+            "item": item,
+            "qty": qty,
+            "price": price,
+            "timestamp": datetime.now().isoformat()
         }
 
-    def is_complete(self):
-        return (
-            self.state["product_id"]
-            and self.state["quantity"]
-            and self.state["name"]
-        )
+        self.current_order.append(entry)
+        return entry
 
-    def next_question(self):
-        if not self.state["product_id"]:
-            return "What would you like to buy? You can ask for mugs, hoodies, or t-shirts."
-        if not self.state["quantity"]:
-            return "How many would you like to order?"
-        if not self.state["name"]:
-            return "May I know your name?"
-        return None
+    def compute_total(self):
+        return sum(x["price"] * x["qty"] for x in self.current_order)
+
+    def finalize_order(self, name):
+        order = {
+            "name": name,
+            "timestamp": datetime.now().isoformat(),      # order timestamp
+            "items": self.current_order,
+            "total": self.compute_total()
+        }
+
+        self.order_history.append(order)
+        self.save_history()
+        self.current_order = []  # clear cart
+        return order
 
 
 # -------------------------------------------------
-#   SHOPPING AGENT
+#   E-COMMERCE AGENT
 # -------------------------------------------------
 
-class ShoppingAgent(Agent):
+class EcommerceAgent(Agent):
 
     def __init__(self):
-        super().__init__(
-            instructions="""
-You are a friendly shopping assistant. Help the user browse items and place an order.
-Use the tools for:
-- searching items,
-- selecting the product (set_product),
-- selecting quantity,
-- saving the final order.
+        super().__init__(instructions="""
+You are an E-commerce Voice Agent that helps customers browse items and place orders.
 
-Never output JSON. Always call tools to modify order.
-Ask only one question at a time.
-"""
-        )
+Your capabilities:
+1. Help users add products to their cart.
+2. When a user wants to buy something, call add_item(item, qty).
+3. When they want to checkout, call finalize_order(name).
+4. When they ask about older orders, call get_order_history().
+5. Never output JSON directly — always speak naturally.
 
-        self.order = OrderState()
+Always be friendly and helpful.
+""")
 
-    # -------------------------------------------------
-    # TOOL: List or search items
-    # -------------------------------------------------
+        self.orders = OrderSystem()
+
+    # ---------- TOOLS ----------
 
     @function_tool
-    async def search_items(self, ctx: RunContext, query: str = "") -> list:
-        """
-        Returns a list of items matching the search query.
-        Matches category, color, or substring in name.
-        """
-        query = query.lower().strip()
-        results = []
-
-        for item in CATALOG:
-            if (
-                query in item["name"].lower()
-                or query in item["category"].lower()
-                or query in item["color"].lower()
-            ):
-                results.append(item)
-
-        return results if results else CATALOG
-
-    # -------------------------------------------------
-    # TOOL: Set selected product
-    # -------------------------------------------------
+    async def add_item(self, ctx: RunContext, item: str, qty: int):
+        """Add the selected item to the current order."""
+        self.orders.add_item(item, qty)
+        return f"Added {qty} {item}(s) to your cart."
 
     @function_tool
-    async def set_product(self, ctx: RunContext, product_id: str) -> str:
-        """
-        Choose which product the user wants to order.
-        """
-        self.order.state["product_id"] = product_id
-        return "product set"
-
-    # -------------------------------------------------
-    # TOOL: Set quantity
-    # -------------------------------------------------
+    async def finalize_order(self, ctx: RunContext, name: str):
+        """Save the order and clear the cart."""
+        order = self.orders.finalize_order(name)
+        return f"Order placed for {name}. Total amount: Rs {order['total']}."
 
     @function_tool
-    async def set_quantity(self, ctx: RunContext, quantity: int) -> str:
-        self.order.state["quantity"] = quantity
-        return "quantity set"
+    async def get_order_history(self, ctx: RunContext):
+        """Fetch previous orders."""
+        if not self.orders.order_history:
+            return "You have no previous orders."
 
-    # -------------------------------------------------
-    # TOOL: Save order
-    # -------------------------------------------------
+        summary = ""
+        for i, order in enumerate(self.orders.order_history, 1):
+            summary += (
+                f"Order {i}: {order['name']} ordered {len(order['items'])} items "
+                f"on {order['timestamp']}. Total Rs {order['total']}. "
+            )
+        return summary
 
-    @function_tool
-    async def save_order(self, ctx: RunContext) -> str:
-        """
-        Save completed order to JSON.
-        """
-        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        filepath = f"{ORDERS_DIR}/order_{ts}.json"
-
-        with open(filepath, "w") as f:
-            json.dump(self.order.state, f, indent=2)
-
-        return filepath
-
-    # -------------------------------------------------
-    # HANDLE USER MESSAGE
-    # -------------------------------------------------
+    # ---------- MESSAGE HANDLER ----------
 
     async def on_user_message(self, msg, ctx):
         text = msg.text.lower()
 
-        # extract number
-        for word in text.split():
-            if word.isdigit():
-                await ctx.tool_call(self.set_quantity, quantity=int(word))
+        # detect item request
+        for item in PRODUCT_CATALOG:
+            if item in text:
+                qty = 1
+                for w in text.split():
+                    if w.isdigit():
+                        qty = int(w)
+                        break
 
-        # detect name
-        if "my name is" in text:
-            name = text.split("my name is")[-1].strip().split()[0]
-            self.order.state["name"] = name.capitalize()
+                await ctx.tool_call(self.add_item, item=item, qty=qty)
+                await ctx.llm_response(f"Added {qty} {item}. Anything else?")
+                return
 
-        # detect product selection
-        for item in CATALOG:
-            if item["name"].lower() in text or item["category"] in text:
-                await ctx.tool_call(self.set_product, product_id=item["id"])
-                break
-
-        # Ask next needed field
-        if not self.order.is_complete():
-            await ctx.llm_response(self.order.next_question())
+        # checkout
+        if "checkout" in text or "place order" in text:
+            await ctx.llm_response("Sure, what name should I put on the order?")
             return
 
-        # Save order
-        filepath = await ctx.tool_call(self.save_order)
+        # name detection
+        if "my name is" in text:
+            name = text.split("my name is")[-1].strip().split()[0]
+            name = name.capitalize()
 
-        # Respond summary
-        p = next(i for i in CATALOG if i["id"] == self.order.state["product_id"])
-        summary = (
-            f"Thanks {self.order.state['name']}! "
-            f"You ordered {self.order.state['quantity']} × {p['name']} "
-            f"for {p['price']} {p['currency']} each. Your order is saved!"
+            await ctx.tool_call(self.finalize_order, name=name)
+            await ctx.llm_response(f"Thanks {name}! Your order is confirmed.")
+            return
+
+        # order history
+        if "previous orders" in text or "order history" in text:
+            result = await ctx.tool_call(self.get_order_history)
+            await ctx.llm_response(result)
+            return
+
+        await ctx.llm_response(
+            "How can I help you today? You can ask for laptops, keyboards, monitors, and more!"
         )
-
-        await ctx.llm_response(summary)
 
 
 # -------------------------------------------------
@@ -201,6 +193,7 @@ Ask only one question at a time.
 
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
+
 
 async def entrypoint(ctx: JobContext):
     ctx.log_context = {"room": ctx.room.name}
@@ -212,11 +205,11 @@ async def entrypoint(ctx: JobContext):
             voice="en-US-matthew",
             style="Conversation",
             tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
-            text_pacing=True
+            text_pacing=True,
         ),
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
-        preemptive_generation=True
+        preemptive_generation=True,
     )
 
     usage_collector = metrics.UsageCollector()
@@ -232,7 +225,7 @@ async def entrypoint(ctx: JobContext):
     ctx.add_shutdown_callback(log_usage)
 
     await session.start(
-        agent=ShoppingAgent(),
+        agent=EcommerceAgent(),
         room=ctx.room,
         room_input_options=RoomInputOptions(
             noise_cancellation=noise_cancellation.BVC(),
