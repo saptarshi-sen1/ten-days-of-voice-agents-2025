@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 from datetime import datetime
+import random
 
 from dotenv import load_dotenv
 from livekit.agents import (
@@ -25,166 +26,334 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel
 logger = logging.getLogger("agent")
 load_dotenv(".env.local")
 
-
 # -------------------------------------------------
-#   PRODUCT CATALOG
-# -------------------------------------------------
-
-PRODUCT_CATALOG = {
-    "laptop": 55000,
-    "mouse": 800,
-    "keyboard": 1200,
-    "monitor": 9000,
-    "headphones": 2500,
-    "speakers": 1800,
-    "webcam": 1500,
-    "pendrive": 600,
-}
-
-
-# -------------------------------------------------
-#   ORDER SYSTEM WITH TIMESTAMPS
+#   PERSISTENCE SETUP
 # -------------------------------------------------
 
-class OrderSystem:
-    def __init__(self):
-        self.current_order = []      # list of item entries
-        self.order_history = self.load_history()
+BASE_DIR = Path(__file__).resolve().parent.parent  # backend/
+IMPROV_DIR = BASE_DIR / "improv_battle"
+IMPROV_DIR.mkdir(exist_ok=True)
 
-    def load_history(self):
-        if not os.path.exists("orders.json"):
-            return []
+
+def save_improv_state(room_name: str, state: dict) -> str:
+    """Save improv game state to a JSON file."""
+    filename = f"improv_{room_name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.json"
+    filepath = IMPROV_DIR / filename
+    
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
+    
+    logger.info(f"Saved improv state to {filepath}")
+    return str(filepath)
+
+
+def load_improv_state(room_name: str) -> dict:
+    """Load the most recent improv state for a room, if it exists."""
+    pattern = f"improv_{room_name}_*.json"
+    existing_files = sorted(IMPROV_DIR.glob(pattern), key=os.path.getmtime, reverse=True)
+    
+    if existing_files:
         try:
-            with open("orders.json", "r") as f:
+            with open(existing_files[0], "r", encoding="utf-8") as f:
                 return json.load(f)
-        except:
-            return []
-
-    def save_history(self):
-        with open("orders.json", "w") as f:
-            json.dump(self.order_history, f, indent=2)
-
-    def add_item(self, item, qty):
-        price = PRODUCT_CATALOG.get(item, 0)
-
-        entry = {
-            "item": item,
-            "qty": qty,
-            "price": price,
-            "timestamp": datetime.now().isoformat()
-        }
-
-        self.current_order.append(entry)
-        return entry
-
-    def compute_total(self):
-        return sum(x["price"] * x["qty"] for x in self.current_order)
-
-    def finalize_order(self, name):
-        order = {
-            "name": name,
-            "timestamp": datetime.now().isoformat(),      # order timestamp
-            "items": self.current_order,
-            "total": self.compute_total()
-        }
-
-        self.order_history.append(order)
-        self.save_history()
-        self.current_order = []  # clear cart
-        return order
+        except Exception as e:
+            logger.warning(f"Failed to load state: {e}")
+    
+    return None
 
 
 # -------------------------------------------------
-#   E-COMMERCE AGENT
+#   IMPROV SCENARIOS
 # -------------------------------------------------
 
-class EcommerceAgent(Agent):
+IMPROV_SCENARIOS = [
+    "You are a barista who has to tell a customer that their latte is actually a portal to another dimension.",
+    "You are a time-travelling tour guide explaining modern smartphones to someone from the 1800s.",
+    "You are a restaurant waiter who must calmly tell a customer that their order has escaped the kitchen.",
+    "You are a customer trying to return an obviously cursed object to a very skeptical shop owner.",
+    "You are a weather reporter who has just discovered that clouds are actually sentient beings.",
+    "You are a librarian who must explain to a child that books are actually sleeping and shouldn't be woken up.",
+    "You are a delivery driver delivering a package to someone who claims they never ordered anything, but the package is clearly addressed to them.",
+    "You are a museum tour guide showing visitors an exhibit that keeps changing when you're not looking.",
+    "You are a flight attendant announcing that the plane will be landing on a cloud instead of a runway.",
+    "You are a doctor explaining to a patient that their X-ray shows they have a tiny orchestra playing inside their chest.",
+]
 
-    def __init__(self):
+
+# -------------------------------------------------
+#   IMPROV BATTLE AGENT
+# -------------------------------------------------
+
+class ImprovBattleAgent(Agent):
+
+    def __init__(self, room_name: str = None):
         super().__init__(instructions="""
-You are an E-commerce Voice Agent that helps customers browse items and place orders.
+You are the host of a TV improv show called "Improv Battle".
 
-Your capabilities:
-1. Help users add products to their cart.
-2. When a user wants to buy something, call add_item(item, qty).
-3. When they want to checkout, call finalize_order(name).
-4. When they ask about older orders, call get_order_history().
-5. Never output JSON directly — always speak naturally.
+Your role:
+- You are a high-energy, witty, and entertaining game show host
+- You clearly explain the rules and keep the game moving
+- You react to performances in a varied, realistic way
 
-Always be friendly and helpful.
+Your style:
+- High-energy and engaging
+- Witty and quick with observations
+- Clear about rules and expectations
+- Reactions should be realistic: sometimes amused, sometimes unimpressed, sometimes pleasantly surprised
+- Light teasing and honest critique are allowed, but stay respectful and non-abusive
+- Mix positive and critical feedback naturally
+
+Game structure:
+1. Introduce the show and explain the basic rules
+2. Run through several improv rounds (typically 3-5)
+3. For each round:
+   - Set a scenario clearly
+   - Ask the player to improvise
+   - Wait for them to perform
+   - Once they finish (they say "end scene", "that's it", or pause significantly), react and move on
+4. At the end, provide a closing summary
+
+Reactions:
+- Comment on what worked, what was weird, or what was flat
+- Mix positive and critical feedback:
+  * Sometimes: "That was hilarious, especially the part where..."
+  * Sometimes: "That felt a bit rushed; you could have leaned more into the character."
+- Randomly choose between more supportive, neutral, or mildly critical tones, while staying constructive and safe
+
+Closing:
+- Summarize what kind of improviser the player seemed to be (emphasis on character, absurdity, emotional range, etc.)
+- Mention specific moments or scenes that stood out
+- Thank the player and close the show
+
+Early exit:
+- If the user clearly indicates they want to stop (e.g., "stop game", "end show", "I'm done"), confirm and gracefully end the session
+
+Keep responses concise and energetic. This is a performance, so be entertaining!
 """)
 
-        self.orders = OrderSystem()
+        self.room_name = room_name or "default"
+        
+        # Temporary tracking (not saved in state)
+        self.current_scenario = None
+        self.user_turns_in_scene = 0
+        
+        # Try to load existing state, otherwise initialize
+        saved_state = load_improv_state(self.room_name)
+        if saved_state:
+            self.improv_state = saved_state
+            logger.info(f"Loaded existing state for room {self.room_name}")
+        else:
+            # Initialize game state - exactly as specified
+            self.improv_state = {
+                "player_name": None,
+                "current_round": 0,
+                "max_rounds": 3,
+                "rounds": [],  # each: {"scenario": str, "host_reaction": str}
+                "phase": "intro",  # "intro" | "awaiting_improv" | "reacting" | "done"
+            }
+            self._save_state()
+    
+    def _save_state(self):
+        """Save current state to file."""
+        try:
+            save_improv_state(self.room_name, self.improv_state)
+        except Exception as e:
+            logger.error(f"Failed to save state: {e}")
 
     # ---------- TOOLS ----------
 
     @function_tool
-    async def add_item(self, ctx: RunContext, item: str, qty: int):
-        """Add the selected item to the current order."""
-        self.orders.add_item(item, qty)
-        return f"Added {qty} {item}(s) to your cart."
+    async def set_player_name(self, ctx: RunContext, name: str):
+        """Set the player's name from their introduction or input."""
+        self.improv_state["player_name"] = name
+        self._save_state()
+        return f"Player name set to {name}"
 
     @function_tool
-    async def finalize_order(self, ctx: RunContext, name: str):
-        """Save the order and clear the cart."""
-        order = self.orders.finalize_order(name)
-        return f"Order placed for {name}. Total amount: Rs {order['total']}."
+    async def start_round(self, ctx: RunContext, scenario: str):
+        """Start a new improv round with the given scenario."""
+        self.improv_state["current_round"] += 1
+        self.improv_state["phase"] = "awaiting_improv"
+        self.current_scenario = scenario
+        self.user_turns_in_scene = 0
+        self._save_state()
+        return f"Round {self.improv_state['current_round']} started with scenario: {scenario}"
 
     @function_tool
-    async def get_order_history(self, ctx: RunContext):
-        """Fetch previous orders."""
-        if not self.orders.order_history:
-            return "You have no previous orders."
+    async def end_round(self, ctx: RunContext, reaction: str):
+        """End the current round and store the host's reaction."""
+        # Store reaction in the most recent round
+        if self.improv_state["rounds"]:
+            self.improv_state["rounds"][-1]["host_reaction"] = reaction
+        self.improv_state["phase"] = "reacting"
+        self._save_state()
+        return "Round ended and reaction stored"
 
-        summary = ""
-        for i, order in enumerate(self.orders.order_history, 1):
-            summary += (
-                f"Order {i}: {order['name']} ordered {len(order['items'])} items "
-                f"on {order['timestamp']}. Total Rs {order['total']}. "
-            )
-        return summary
+    @function_tool
+    async def end_game(self, ctx: RunContext):
+        """Mark the game as complete."""
+        self.improv_state["phase"] = "done"
+        self._save_state()
+        return "Game ended"
 
     # ---------- MESSAGE HANDLER ----------
 
-    async def on_user_message(self, msg, ctx):
-        text = msg.text.lower()
+    async def on_user_message(self, msg, ctx: RunContext):
+        user_text = msg.text.strip().lower()
+        logger.info(f"User message: {user_text}")
 
-        # detect item request
-        for item in PRODUCT_CATALOG:
-            if item in text:
-                qty = 1
-                for w in text.split():
-                    if w.isdigit():
-                        qty = int(w)
-                        break
+        # Extract player name from first message if not set
+        if not self.improv_state["player_name"]:
+            # Try to get name from room participant metadata if available
+            try:
+                if hasattr(ctx.session, 'room') and ctx.session.room:
+                    participants = ctx.session.room.remote_participants.values()
+                    for participant in participants:
+                        if participant.metadata:
+                            try:
+                                metadata = json.loads(participant.metadata)
+                                if "playerName" in metadata:
+                                    await ctx.tool_call(self.set_player_name, name=metadata["playerName"])
+                                    break
+                            except:
+                                pass
+            except:
+                pass
+            
+            # If still not set, try to extract from message
+            if not self.improv_state["player_name"]:
+                if "my name is" in user_text:
+                    name = user_text.split("my name is")[-1].strip().split()[0]
+                    name = name.capitalize()
+                    await ctx.tool_call(self.set_player_name, name=name)
+                elif "i'm" in user_text and len(user_text.split()) <= 5:
+                    # Simple "I'm John" pattern
+                    parts = user_text.split("i'm")
+                    if len(parts) > 1:
+                        name = parts[-1].strip().split()[0]
+                        name = name.capitalize()
+                        await ctx.tool_call(self.set_player_name, name=name)
+                else:
+                    # Default name
+                    await ctx.tool_call(self.set_player_name, name="Contestant")
 
-                await ctx.tool_call(self.add_item, item=item, qty=qty)
-                await ctx.llm_response(f"Added {qty} {item}. Anything else?")
+        # Check for early exit
+        exit_phrases = ["stop game", "end show", "i'm done", "that's all", "end the game", "stop the game"]
+        if any(phrase in user_text for phrase in exit_phrases) and self.improv_state["phase"] != "done":
+            await ctx.tool_call(self.end_game)
+            await ctx.llm_response(
+                "Alright, we're wrapping up! Thanks for playing Improv Battle. Hope you had fun!"
+            )
+            return
+
+        # Handle game phases
+        if self.improv_state["phase"] == "intro":
+            # Start the first round
+            scenario = random.choice(IMPROV_SCENARIOS)
+            await ctx.tool_call(self.start_round, scenario=scenario)
+            
+            player_name = self.improv_state["player_name"] or "Contestant"
+            intro = f"""Welcome to Improv Battle! I'm your host, and you're our contestant, {player_name}!
+
+Here's how it works: I'll give you a scenario, and you'll improvise a scene. Just act it out, get into character, and have fun with it. When you're done, say "end scene" or just pause, and I'll give you my thoughts.
+
+Ready? Let's start with Round 1!
+
+{scenario}
+
+Go ahead, {player_name} - the stage is yours!"""
+            await ctx.llm_response(intro)
+            return
+
+        elif self.improv_state["phase"] == "awaiting_improv":
+            # Player is performing
+            self.user_turns_in_scene += 1
+            
+            # Check if scene is ending
+            # Use simple heuristics: specific phrase ("End scene", "Okay") or maximum number of user turns
+            end_indicators = ["end scene", "that's it", "that's all", "okay", "ok", "scene", "done", "finished", "the end"]
+            is_ending = any(indicator in user_text for indicator in end_indicators)
+            
+            # Also end if they've had multiple turns (heuristic: max 3 turns)
+            if is_ending or self.user_turns_in_scene >= 3:
+                # Store the round with scenario - reaction will be updated after LLM response
+                self.improv_state["rounds"].append({
+                    "scenario": self.current_scenario,
+                    "host_reaction": "",  # Will be filled after LLM generates response
+                })
+                self._save_state()
+                
+                # Move phase to reacting
+                self.improv_state["phase"] = "reacting"
+                self._save_state()
+                
+                # Check if more rounds
+                if self.improv_state["current_round"] < self.improv_state["max_rounds"]:
+                    # Generate reaction and transition to next round
+                    reaction_prompt = f"""
+The player just finished their improv scene for this scenario: "{self.current_scenario}"
+
+Their performance included: "{user_text}"
+
+Now give your reaction as the host. Be varied - randomly choose between:
+- Amused and supportive: "That was hilarious, especially the part where..."
+- Neutral with constructive feedback: "Interesting take. I noticed..."
+- Mildly critical but constructive: "That felt a bit rushed; you could have leaned more into the character."
+
+Comment on what worked, what was weird, or what was flat. Keep it short (2-3 sentences), entertaining, and constructive.
+
+After your reaction, immediately transition to the next round by saying something like "Great! Now let's move to Round {self.improv_state['current_round'] + 1}!" and then present the next scenario.
+
+Current round: {self.improv_state['current_round']} of {self.improv_state['max_rounds']}
+"""
+                    # Get next scenario
+                    next_scenario = random.choice(IMPROV_SCENARIOS)
+                    await ctx.tool_call(self.start_round, scenario=next_scenario)
+                    
+                    # Generate reaction with next scenario
+                    full_prompt = f"""{reaction_prompt}
+
+Next scenario for Round {self.improv_state['current_round']}: {next_scenario}
+
+After your reaction, present this next scenario and ask the player to start improvising.
+"""
+                    await ctx.llm_response(full_prompt)
+                    # Note: We can't capture the LLM response text directly, but the reaction is in the conversation
+                    # The state will be saved with empty reaction, which is acceptable
+                else:
+                    # Game over - closing summary
+                    await ctx.tool_call(self.end_game)
+                    summary_prompt = f"""
+The player just finished their final improv scene for this scenario: "{self.current_scenario}"
+
+Their performance included: "{user_text}"
+
+Give your reaction to this final scene (2-3 sentences), then provide a closing summary:
+- Summarize what kind of improviser the player seemed to be (emphasis on character, absurdity, emotional range, etc.)
+- Mention specific moments or scenes that stood out
+- Thank the player and close the show
+
+Keep it warm, entertaining, and about 4-6 sentences total.
+"""
+                    await ctx.llm_response(summary_prompt)
+            else:
+                # Still in the scene - let them continue without interrupting
                 return
 
-        # checkout
-        if "checkout" in text or "place order" in text:
-            await ctx.llm_response("Sure, what name should I put on the order?")
+        elif self.improv_state["phase"] == "reacting":
+            # Transitioning between rounds - should move to awaiting_improv
+            self.improv_state["phase"] = "awaiting_improv"
+            self._save_state()
+            await ctx.llm_response("Let's continue!")
             return
 
-        # name detection
-        if "my name is" in text:
-            name = text.split("my name is")[-1].strip().split()[0]
-            name = name.capitalize()
-
-            await ctx.tool_call(self.finalize_order, name=name)
-            await ctx.llm_response(f"Thanks {name}! Your order is confirmed.")
+        elif self.improv_state["phase"] == "done":
+            # Game is over
+            await ctx.llm_response("Thanks for playing Improv Battle! The show is over. Have a great day!")
             return
 
-        # order history
-        if "previous orders" in text or "order history" in text:
-            result = await ctx.tool_call(self.get_order_history)
-            await ctx.llm_response(result)
-            return
-
-        await ctx.llm_response(
-            "How can I help you today? You can ask for laptops, keyboards, monitors, and more!"
-        )
+        # Fallback
+        await ctx.llm_response("I'm not sure what you mean. Let's keep the improv going!")
 
 
 # -------------------------------------------------
@@ -225,7 +394,7 @@ async def entrypoint(ctx: JobContext):
     ctx.add_shutdown_callback(log_usage)
 
     await session.start(
-        agent=EcommerceAgent(),
+        agent=ImprovBattleAgent(room_name=ctx.room.name),
         room=ctx.room,
         room_input_options=RoomInputOptions(
             noise_cancellation=noise_cancellation.BVC(),
@@ -237,3 +406,4 @@ async def entrypoint(ctx: JobContext):
 
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
+

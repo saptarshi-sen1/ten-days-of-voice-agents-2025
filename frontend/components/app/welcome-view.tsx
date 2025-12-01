@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { Button } from '@/components/livekit/button';
 
 function WelcomeImage() {
@@ -20,7 +21,7 @@ function WelcomeImage() {
 
 interface WelcomeViewProps {
   startButtonText: string;
-  onStartCall: () => void;
+  onStartCall: (playerName: string) => void;
 }
 
 export const WelcomeView = ({
@@ -28,18 +29,50 @@ export const WelcomeView = ({
   onStartCall,
   ref,
 }: React.ComponentProps<'div'> & WelcomeViewProps) => {
+  const [playerName, setPlayerName] = useState('');
+
+  const handleStart = () => {
+    if (playerName.trim()) {
+      onStartCall(playerName.trim());
+    }
+  };
+
   return (
     <div ref={ref}>
       <section className="bg-background flex flex-col items-center justify-center text-center">
         <WelcomeImage />
 
         <p className="text-foreground max-w-prose pt-1 leading-6 font-medium">
-          Chat live with your voice AI agent
+          Welcome to Improv Battle!
         </p>
 
-        <Button variant="primary" size="lg" onClick={onStartCall} className="mt-6 w-64 font-mono">
-          {startButtonText}
-        </Button>
+        <p className="text-muted-foreground max-w-prose pt-2 text-sm leading-5">
+          Enter your contestant name to start the game
+        </p>
+
+        <div className="mt-6 w-64 flex flex-col gap-3">
+          <input
+            type="text"
+            placeholder="Your name"
+            value={playerName}
+            onChange={(e) => setPlayerName(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && playerName.trim()) {
+                handleStart();
+              }
+            }}
+            className="px-4 py-2 border border-border rounded-md bg-background text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+          />
+          <Button
+            variant="primary"
+            size="lg"
+            onClick={handleStart}
+            disabled={!playerName.trim()}
+            className="w-full font-mono"
+          >
+            {startButtonText}
+          </Button>
+        </div>
       </section>
 
       <div className="fixed bottom-5 left-0 flex w-full items-center justify-center">

@@ -1,0 +1,7 @@
+{
+  "player_name": null,
+  "current_round": 0,
+  "max_rounds": 3,
+  "rounds": [],
+  "phase": "intro"
+}

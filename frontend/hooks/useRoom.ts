@@ -7,6 +7,7 @@ export function useRoom(appConfig: AppConfig) {
   const aborted = useRef(false);
   const room = useMemo(() => new Room(), []);
   const [isSessionActive, setIsSessionActive] = useState(false);
+  const playerNameRef = useRef<string | undefined>(undefined);
 
   useEffect(() => {
     function onDisconnected() {
@@ -57,6 +58,7 @@ export function useRoom(appConfig: AppConfig) {
                     agents: [{ agent_name: appConfig.agentName }],
                   }
                 : undefined,
+              playerName: playerNameRef.current,
             }),
           });
           return await res.json();
@@ -68,8 +70,9 @@ export function useRoom(appConfig: AppConfig) {
     [appConfig]
   );
 
-  const startSession = useCallback(() => {
+  const startSession = useCallback((playerName?: string) => {
     setIsSessionActive(true);
+    playerNameRef.current = playerName;
 
     if (room.state === 'disconnected') {
       const { isPreConnectBufferEnabled } = appConfig;
